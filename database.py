@@ -182,25 +182,59 @@ def get_user_status_data(user_id, month_str):
             limits = {'FREE': 3, 'BASIC': 8, 'ADVANCED': 50, 'BUSINESS': 150, 'ADMIN': 99999}
             free_limit = limits.get(tier, 3)
 
-            # 跨月重置邏輯 (僅針對免費方案用戶；付費訂閱用戶的額度跟隨藍新扣款週期重置)
+            # 額度自動刷新與週期重置邏輯 (支援免費會員與付費/年約會員按專屬重置日 YYYY-MM-DD 自動重置)
             usage = row['usage_count'] or 0
-            db_month = row['usage_month'][:7] if row['usage_month'] else ""
-            if db_month != month_str:
-                tz_tw = datetime.timezone(datetime.timedelta(hours=8))
-                today = datetime.datetime.now(tz_tw)
-                if today.strftime('%Y-%m') == month_str:
-                    write_date = today.strftime('%Y-%m-%d')
-                else:
-                    write_date = f"{month_str}-01"
+            
+            tz_tw = datetime.timezone(datetime.timedelta(hours=8))
+            now = datetime.datetime.now(tz_tw)
+            today_str = now.strftime('%Y-%m-%d')
+            
+            # 如果沒有 usage_month，先初始化為今日
+            if not row['usage_month']:
+                usage_month_str = today_str
+                cur.execute("UPDATE users SET usage_month = %s WHERE user_id = %s", (today_str, user_id))
+                conn.commit()
+            else:
+                usage_month_str = row['usage_month']
 
-                if tier == 'FREE':
-                    usage = 0
-                    cur.execute("UPDATE users SET usage_month = %s, usage_count = 0 WHERE user_id = %s", (write_date, user_id))
-                    conn.commit()
-                else:
-                    # 訂閱用戶只更新月份欄位，不重設已使用次數
-                    cur.execute("UPDATE users SET usage_month = %s WHERE user_id = %s", (write_date, user_id))
-                    conn.commit()
+            # 相容舊版 'YYYY-MM' 格式，補上 '-01' 以便解析
+            if len(usage_month_str) == 7:
+                usage_month_str = f"{usage_month_str}-01"
+                
+            try:
+                last_reset_date = datetime.datetime.strptime(usage_month_str, '%Y-%m-%d').date()
+            except ValueError:
+                last_reset_date = now.date()
+
+            current_date = now.date()
+            
+            # 計算下一次重置日期 (last_reset_date 的下個月同日，若下個月天數不足則取最後一天)
+            def get_next_reset_date(start_date):
+                year = start_date.year
+                month = start_date.month + 1
+                if month > 12:
+                    month = 1
+                    year += 1
+                day = start_date.day
+                import calendar
+                last_day_of_month = calendar.monthrange(year, month)[1]
+                if day > last_day_of_month:
+                    day = last_day_of_month
+                return datetime.date(year, month, day)
+
+            # 循環計算，直至下一次重置日大於今日，藉此找出最新應重置的基準日
+            next_reset = get_next_reset_date(last_reset_date)
+            should_reset = False
+            while current_date >= next_reset:
+                should_reset = True
+                last_reset_date = next_reset
+                next_reset = get_next_reset_date(last_reset_date)
+                
+            if should_reset:
+                usage = 0
+                write_date = last_reset_date.strftime('%Y-%m-%d')
+                cur.execute("UPDATE users SET usage_month = %s, usage_count = 0 WHERE user_id = %s", (write_date, user_id))
+                conn.commit()
 
             return {
                 "tier": tier,
